@@ -2835,8 +2835,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
+                            wait = float(retry_after) if retry_after is not None else 1.0
+                            if wait > 5.0:
+                                # Telegram can return multi-minute flood waits after
+                                # streaming edits.  Sleeping here lets several
+                                # delivery paths wake up later and post the same
+                                # final response.  Return a retryable failure so the
+                                # caller can make one idempotent delivery decision.
+                                return SendResult(
+                                    success=False,
+                                    error=f"flood_control:{wait}",
+                                    retryable=True,
+                                )
                             if _send_attempt < 2:
-                                wait = float(retry_after) if retry_after is not None else 1.0
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
                                     self.name,
@@ -3196,6 +3207,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 # send continuations.
                 pass
             else:
+                retry_after = getattr(e, "retry_after", None)
+                if retry_after is not None or "retry after" in err_str or "flood" in err_str:
+                    wait = float(retry_after) if retry_after is not None else 1.0
+                    logger.warning(
+                        "[%s] Overflow split: first-chunk edit hit flood control "
+                        "(%.1fs); deferring fallback delivery",
+                        self.name,
+                        wait,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=f"flood_control:{wait}",
+                        retryable=True,
+                    )
                 logger.error(
                     "[%s] Overflow split: first-chunk edit failed: %s",
                     self.name, e, exc_info=True,

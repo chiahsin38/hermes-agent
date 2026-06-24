@@ -54,6 +54,65 @@ def adapter():
 
 
 # =========================================================================
+# Flood-control delivery behavior
+# =========================================================================
+
+
+class _RetryAfterError(Exception):
+    def __init__(self, seconds):
+        super().__init__(f"Flood control exceeded. Retry in {seconds} seconds")
+        self.retry_after = seconds
+
+
+@pytest.mark.asyncio
+async def test_send_long_flood_wait_returns_retryable_without_sleep(adapter, monkeypatch):
+    """Long Telegram flood waits must not sleep inside adapter.send().
+
+    Sleeping for minutes allows fallback/final delivery paths to wake later and
+    post duplicates. The adapter should surface a retryable flood failure and
+    let the stream/gateway layer make one delivery decision.
+    """
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(side_effect=_RetryAfterError(166))
+    sleep = AsyncMock()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
+
+    result = await adapter.send("123", "hello")
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.error == "flood_control:166.0"
+    sleep.assert_not_awaited()
+    assert adapter._bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_overflow_first_chunk_flood_returns_retryable_without_stack(adapter):
+    """Oversized edit overflow should treat first-chunk flood as retryable.
+
+    This is the path that duplicated long Telegram replies: overflow split tried
+    to edit chunk 1, hit RetryAfter, then competing fallback/final sends each
+    retried later. Returning a flood_control result lets the consumer back off
+    instead of creating another delayed sender.
+    """
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock(side_effect=_RetryAfterError(166))
+    adapter._bot.send_message = AsyncMock()
+
+    result = await adapter.edit_message(
+        "123",
+        "456",
+        "x" * (adapter.MAX_MESSAGE_LENGTH + 100),
+        finalize=True,
+    )
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.error == "flood_control:166.0"
+    adapter._bot.send_message.assert_not_awaited()
+
+
+# =========================================================================
 # _escape_mdv2
 # =========================================================================
 
