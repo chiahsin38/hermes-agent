@@ -11,6 +11,7 @@ Subcommands:
   (none)   Log in to Nous Portal + set it up (one-shot onboarding).
   login    Explicit alias for the default one-shot onboarding.
   info     Show Portal auth state + which Tool Gateway tools are routed.
+  credits  Show subscription credits remaining and period end.
   open     Open the Portal subscription page in the user's default browser.
   tools    List Tool Gateway tools and which are active in the current config.
 
@@ -189,6 +190,50 @@ def _cmd_login(args) -> int:
     return 0
 
 
+def _cmd_credits(args) -> int:
+    """Show Nous Portal subscription credits and period, via /api/oauth/account.
+
+    Uses the already-stored OAuth token (no user login, no browser). Falls
+    back to a JWT-only summary when the account API is unreachable.
+    """
+    from hermes_cli.nous_account import get_nous_portal_account_info
+
+    info = get_nous_portal_account_info(force_fresh=True)
+
+    if not info.logged_in:
+        print(color("  Not logged into Nous Portal — sign in with `hermes portal`.", Colors.YELLOW))
+        return 1
+
+    print(color("  Nous Portal — Subscription credits", Colors.MAGENTA))
+    print(color("  ───────────────────────────────────", Colors.MAGENTA))
+
+    s = info.subscription
+    p = info.paid_service_access_info
+    if s is not None and s.credits_remaining is not None:
+        plan = s.plan or "unknown"
+        print(f"  Plan:              {plan}")
+        if s.monthly_charge is not None:
+            print(f"  Monthly charge:    ${s.monthly_charge:.2f}")
+        if s.monthly_credits is not None:
+            print(f"  Monthly credits:   ${s.monthly_credits:.2f}")
+        print(f"  Credits remaining: ${s.credits_remaining:.2f}")
+        if s.rollover_credits:
+            print(f"  Rollover credits:  ${s.rollover_credits:.2f}")
+        if s.current_period_end:
+            print(f"  Period ends:       {s.current_period_end}")
+    elif p is not None and p.total_usable_credits is not None:
+        print(f"  Credits remaining: ${p.total_usable_credits:.2f}")
+        if p.subscription_credits_remaining is not None:
+            print(f"  Subscription:      ${p.subscription_credits_remaining:.2f}")
+        if p.purchased_credits_remaining:
+            print(f"  Purchased:         ${p.purchased_credits_remaining:.2f}")
+    else:
+        print(color("  Credits remaining: unavailable (account API unreachable)", Colors.YELLOW))
+
+    print(color(f"  Manage: {SUBSCRIPTION_URL}", Colors.DIM))
+    return 0
+
+
 def portal_command(args) -> int:
     """Top-level dispatch for `hermes portal <subcommand>`."""
     sub = getattr(args, "portal_command", None)
@@ -197,6 +242,8 @@ def portal_command(args) -> int:
         # human-readable alias for `hermes auth add nous --type oauth` /
         # `hermes setup --portal`.
         return _cmd_login(args)
+    if sub == "credits":
+        return _cmd_credits(args)
     if sub in {"info", "status"}:
         # `status` kept as a back-compat alias for the prior default.
         return _cmd_status(args)
@@ -231,6 +278,10 @@ def add_parser(subparsers) -> None:
     portal_sub.add_parser(
         "info",
         help="Show Portal auth + Tool Gateway routing summary",
+    )
+    portal_sub.add_parser(
+        "credits",
+        help="Show subscription credits remaining and period end",
     )
     # `status` retained as a hidden back-compat alias for `info`.
     portal_sub.add_parser("status")
