@@ -1004,6 +1004,11 @@ def apply_subprocess_home_env(env: MutableMapping[str, str]) -> None:
 SCRATCH_TMP_ENV_VARS = ("TMPDIR", "TMP", "TEMP")
 SCRATCH_DIR_MARKER_ENV = "HERMES_SCRATCH_DIR"
 SCRATCH_MAX_AGE_HOURS = 72
+# Retention alone is not a ceiling: a fan-out of heavy suites can write tens of GB *inside* the
+# 72h window and fill the volume, after which every later write in the home (logs, state DB,
+# fixtures) fails with ENOSPC. Trim the dir to this many bytes as well; 0/negative disables.
+SCRATCH_MAX_BYTES = 8 * 1024 ** 3
+SCRATCH_MAX_BYTES_ENV = "HERMES_SCRATCH_MAX_BYTES"
 _SCRATCH_PRUNE_STAMP = ".last_prune"
 _SCRATCH_PRUNE_INTERVAL_SECONDS = 3600
 _scratch_pruned_once = False
@@ -1147,7 +1152,8 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     Every Hermes process and child gets ``TMPDIR``/``TMP``/``TEMP`` pointed here at boot (see
     :func:`export_scratch_tmp_env`), so ``tempfile`` defaults land here without call sites
     knowing. Entries older than ``SCRATCH_MAX_AGE_HOURS`` are pruned at most once per process
-    and once per hour across processes (stamp file), so a fan-out of children stays cheap.
+    and once per hour across processes (stamp file), so a fan-out of children stays cheap;
+    the same pass trims the dir to ``SCRATCH_MAX_BYTES`` so heavy suites cannot fill the volume.
 
     Permissions follow :func:`apply_secure_dir_policy`, so an explicit ``HERMES_HOME_MODE`` or
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
@@ -1165,29 +1171,77 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     return scratch
 
 
-def prune_scratch_dir(scratch: Path | None = None, max_age_hours: float = SCRATCH_MAX_AGE_HOURS) -> int:
-    """Delete top-level scratch entries untouched for *max_age_hours*; return the count removed."""
+def _scratch_entry_bytes(path: Path) -> int:
+    """Bytes a top-level scratch entry occupies (0 when unreadable); a symlink counts as itself."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            total = 0
+            for dirpath, dirnames, filenames in os.walk(path, onerror=lambda _e: None):
+                for name in dirnames + filenames:
+                    try:
+                        total += os.lstat(os.path.join(dirpath, name)).st_size
+                    except OSError:
+                        continue
+            return total
+        return path.lstat().st_size
+    except OSError:
+        return 0
+
+
+def _remove_scratch_entry(entry: Path) -> bool:
+    """Delete one top-level scratch entry; False when it could not be removed."""
+    try:
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def prune_scratch_dir(scratch: Path | None = None, max_age_hours: float = SCRATCH_MAX_AGE_HOURS,
+                      max_bytes: int | None = None) -> int:
+    """Trim the scratch dir to its retention *and* its size ceiling; return the count removed.
+
+    Pass 1 keeps the documented behaviour: every top-level entry untouched for *max_age_hours*
+    goes. Pass 2 then walks the survivors oldest-first and deletes them until the dir fits
+    *max_bytes* — default ``HERMES_SCRATCH_MAX_BYTES``, else :data:`SCRATCH_MAX_BYTES`; ``<= 0``
+    disables the ceiling — so one burst of heavy suites cannot fill the volume while its entries
+    are still inside the retention window. The **most recent** entry is never deleted, even when
+    it alone exceeds the ceiling. Never raises; unreadable entries are left in place.
+    """
     import time
+    from utils import env_int  # local: keeps the module import graph free of utils at import time
+
     root = scratch if scratch is not None else get_scratch_dir(prune=False)
+    if max_bytes is None:
+        max_bytes = env_int(SCRATCH_MAX_BYTES_ENV, SCRATCH_MAX_BYTES)
     cutoff = time.time() - max_age_hours * 3600
     removed = 0
     try:
-        entries = list(root.iterdir())
+        entries = [e for e in root.iterdir() if e.name != _SCRATCH_PRUNE_STAMP]
     except OSError:
         return 0
+    survivors: list[tuple[float, Path]] = []
     for entry in entries:
-        if entry.name == _SCRATCH_PRUNE_STAMP:
-            continue
         try:
-            if entry.lstat().st_mtime >= cutoff:
-                continue
-            if entry.is_dir() and not entry.is_symlink():
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
-                entry.unlink()
-            removed += 1
+            mtime = entry.lstat().st_mtime
         except OSError:
             continue
+        if mtime < cutoff:
+            removed += 1 if _remove_scratch_entry(entry) else 0
+        else:
+            survivors.append((mtime, entry))
+    if max_bytes is not None and max_bytes > 0 and len(survivors) > 1:
+        sizes = {str(entry): _scratch_entry_bytes(entry) for _mtime, entry in survivors}
+        total = sum(sizes.values())
+        for _mtime, entry in sorted(survivors)[:-1]:  # newest entry is always kept
+            if total <= max_bytes:
+                break
+            if _remove_scratch_entry(entry):
+                removed += 1
+                total -= sizes.get(str(entry), 0)
     return removed
 
 

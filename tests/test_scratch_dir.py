@@ -58,6 +58,64 @@ def test_prune_removes_only_stale_top_level_entries(tmp_path):
     assert not stale.exists() and fresh.exists()
 
 
+def test_prune_enforces_size_ceiling_oldest_first(tmp_path):
+    """Inside the retention window a burst of heavy suites is still trimmed to the ceiling."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    now = time.time()
+    for i, name in enumerate(("oldest", "middle", "newest")):
+        d = scratch / name
+        d.mkdir()
+        (d / "f").write_bytes(b"x" * 4096)
+        os.utime(d, (now - 300 + i, now - 300 + i))  # all fresh: retention keeps all three
+    assert prune_scratch_dir(scratch, max_bytes=8 * 1024) == 1
+    assert not (scratch / "oldest").exists()
+    assert (scratch / "middle").exists() and (scratch / "newest").exists()
+
+
+def test_prune_leaves_everything_when_under_the_ceiling(tmp_path):
+    """Below the ceiling nothing is deleted — the ceiling must not become a blanket wipe."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    (scratch / "a").write_bytes(b"x" * 10)
+    (scratch / "b").write_bytes(b"x" * 10)
+    assert prune_scratch_dir(scratch, max_bytes=1024) == 0
+    assert sorted(p.name for p in scratch.iterdir()) == ["a", "b"]
+
+
+def test_prune_never_deletes_the_newest_entry(tmp_path):
+    """One entry above the ceiling survives: never throw away the work that is still arriving."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    (scratch / "only").write_bytes(b"x" * 4096)
+    assert prune_scratch_dir(scratch, max_bytes=16) == 0
+    assert (scratch / "only").exists()
+
+
+def test_prune_ceiling_is_configurable_by_env_and_zero_disables(tmp_path, monkeypatch):
+    """The ceiling is read from HERMES_SCRATCH_MAX_BYTES at call time; 0 turns it off."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    (scratch / "big").write_bytes(b"x" * 4096)
+    (scratch / "small").write_bytes(b"x" * 8)
+    monkeypatch.setenv("HERMES_SCRATCH_MAX_BYTES", "16")
+    assert prune_scratch_dir(scratch) == 1
+    assert (scratch / "small").exists() and not (scratch / "big").exists()
+    (scratch / "big2").write_bytes(b"x" * 4096)
+    monkeypatch.setenv("HERMES_SCRATCH_MAX_BYTES", "0")
+    assert prune_scratch_dir(scratch) == 0  # disabled: nothing goes, however big the dir is
+
+
+def test_retention_and_ceiling_are_counted_together(tmp_path):
+    """A stale entry goes by retention and a fresh oversized one by the ceiling; counts add up."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    stale = scratch / "stale"
+    stale.mkdir()
+    (stale / "f").write_bytes(b"x" * 10)
+    ancient = time.time() - 100 * 3600
+    os.utime(stale, (ancient, ancient))
+    (scratch / "fat").write_bytes(b"x" * 8192)      # fresh, above the ceiling
+    (scratch / "tiny").write_bytes(b"x" * 4)
+    assert prune_scratch_dir(scratch, max_bytes=16) == 2
+    assert [p.name for p in scratch.iterdir()] == ["tiny"]
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory modes")
 class TestScratchDirPermissionPolicy:
     """get_scratch_dir must honor the home permission policy instead of a blanket 0700:
