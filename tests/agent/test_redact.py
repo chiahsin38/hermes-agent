@@ -1633,3 +1633,48 @@ class TestRedactForEgress:
         from agent import redact as R
         monkeypatch.setattr(R, "redact_sensitive_text", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert R.redact_for_egress("sk-live-0123456789abcdef") == R.REDACTION_UNAVAILABLE
+
+
+class TestJsonEscapedCredentials:
+    """JSON-encoded tool arguments (``json.dumps`` output, escaped trace bodies).
+
+    A credential sits directly before the backslash that escapes its closing
+    quote (``Bearer TOKEN\\"``).  Masking must not swallow that backslash: the
+    encoded JSON stops parsing and ``hermes sessions export`` refuses the trace
+    (fail-closed) — real case from a qualification run (2026-10-17)."""
+
+    LONG = "opencode-tok-ABCDEFGH1234567890xyzw"
+
+    def test_auth_header_long_token_keeps_json_parseable(self):
+        import json as _json
+        raw = _json.dumps({"command": f'curl -H "Authorization: Bearer {self.LONG}" -o /tmp/ocm.json -w "http=%{{http_code}}"'})
+        out = redact_sensitive_text(raw, force=True)
+        parsed = _json.loads(out)  # raises before the escape-keeping fix
+        assert self.LONG not in out
+        assert "ocm.json" in parsed["command"]
+        assert "%{http_code}" in parsed["command"]
+
+    def test_auth_header_short_value_keeps_json_parseable(self):
+        import json as _json
+        raw = _json.dumps({"command": 'curl -H "Authorization: Bearer $V" -o /tmp/x'})
+        out = redact_sensitive_text(raw, force=True)
+        parsed = _json.loads(out)
+        assert 'Bearer ***"' in parsed["command"]
+
+    def test_secret_header_short_value_keeps_json_parseable(self):
+        import json as _json
+        raw = _json.dumps({"command": 'curl -H "x-api-key: $V"'})
+        out = redact_sensitive_text(raw, force=True)
+        parsed = _json.loads(out)
+        assert "x-api-key: ***" in parsed["command"]
+
+    def test_secret_header_long_token_keeps_json_parseable(self):
+        import json as _json
+        raw = _json.dumps({"command": f'curl -H "x-api-key: {self.LONG}"'})
+        out = redact_sensitive_text(raw, force=True)
+        _json.loads(out)
+        assert self.LONG not in out
+
+    def test_plain_text_header_still_masks(self):
+        out = redact_sensitive_text(f"Authorization: Bearer {self.LONG}", force=True)
+        assert self.LONG not in out

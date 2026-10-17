@@ -501,9 +501,12 @@ _AUTH_HEADER_RE = re.compile(r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s
 
 # API-key style headers (single opaque value, no scheme word): non-vendor-prefix
 # values would otherwise leak when a curl command is echoed into tool output.
+# The value class excludes quotes the same way _AUTH_HEADER_RE's does: in
+# JSON-escaped text the closing quote arrives as ``\"`` and a class that swallows
+# it (or the escape backslash before it) corrupts the encoded syntax.
 SECRET_HEADER_NAME_LIST = ("x-api-key", "x-goog-api-key", "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token")
 _SECRET_HEADER_NAMES = rf"(?:{'|'.join(SECRET_HEADER_NAME_LIST)})"
-_SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
+_SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)([^\s\"']+)", re.IGNORECASE)
 
 # Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. The lookbehind
 # anchors the id at the start of its digit run: without it, a long run of digits
@@ -653,6 +656,19 @@ def _mask_token(token: str) -> str:
     if not token:
         return "***"
     return mask_secret(token, head=6, tail=4, floor=18)
+
+
+def _mask_token_keep_escapes(token: str) -> str:
+    """``_mask_token``, but leave the token's trailing backslash run in place.
+
+    In JSON-encoded text (``json.dumps``-ed tool arguments, escaped trace
+    bodies) a credential sits directly before the backslash that escapes its
+    closing quote (``Bearer TOKEN\\"``).  Masking through that backslash turns
+    the closing quote into a bare one and the encoded JSON stops parsing —
+    ``hermes sessions export`` then refuses the trace.  Mask the credential
+    body, keep the escape run."""
+    core = token.rstrip("\\")
+    return _mask_token(core) + token[len(core):]
 
 
 def _is_python_repr_secret_key(key: str) -> bool:
@@ -955,10 +971,10 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _redact_assignments(text, mask_nonreusable=file_read)
 
     if "uthorization" in text or "UTHORIZATION" in text:  # cheapest gate over every casing
-        text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
+        text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token_keep_escapes(m.group(3)), text)
 
     if ":" in text:
-        text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
+        text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token_keep_escapes(m.group(2)), text)
         text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
 
     if "BEGIN" in text and "-----" in text:
