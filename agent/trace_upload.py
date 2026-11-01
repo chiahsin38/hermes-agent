@@ -88,6 +88,52 @@ def _parse_tool_args(raw_args: Any) -> dict[str, Any]:
         return {"_raw": raw_args}
 
 
+def _mask_credential(value: str) -> str:
+    """Mask a value held by a credential-named field (same floor/prefix policy as log tokens)."""
+    try:
+        from agent.redact import _mask_token
+        return _mask_token(value)
+    except Exception:  # pragma: no cover - redactor import problems must not leak the value
+        return "***"
+
+
+def _redact_tool_args(value: Any, redact: bool) -> Any:
+    """Redact tool-call arguments *structurally* instead of re-parsing serialized JSON.
+
+    The previous implementation redacted ``json.dumps(parsed)`` and then re-parsed the
+    result (``json.loads(_redact(json.dumps(parsed)))``). That aborts the whole trace
+    export whenever the text redactor consumes a structural character — e.g.
+    ``{"command": "export PASSWORD=hunter2"}`` masks as ``... PASSWORD=***`` (the value
+    pattern swallows the closing quote and brace), so the re-parse fails and
+    ``TraceRedactionError`` refuses the export (seen as "沒有 Hermes trace" INVALID
+    verdicts in exam runs). Walking the structure keeps valid JSON by construction and
+    still masks credential-named fields by key name.
+    """
+    if not redact:
+        return value
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, str) and isinstance(key, str):
+                try:
+                    from agent.redact import is_secret_field_name
+                    secret_key = is_secret_field_name(key)
+                except Exception:  # pragma: no cover
+                    secret_key = False
+                if secret_key and item:
+                    out[key] = _mask_credential(item)
+                    continue
+                out[key] = _redact(item, redact)
+                continue
+            out[key] = _redact_tool_args(item, redact)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_redact_tool_args(item, redact) for item in value]
+    if isinstance(value, str):
+        return _redact(value, redact)
+    return value
+
+
 def _tool_calls_to_blocks(tool_calls: Any, redact: bool) -> list[dict[str, Any]]:
     """Convert OpenAI tool_calls into Anthropic ``tool_use`` content blocks."""
     blocks: list[dict[str, Any]] = []
@@ -97,11 +143,7 @@ def _tool_calls_to_blocks(tool_calls: Any, redact: bool) -> list[dict[str, Any]]
         fn = tc.get("function") or {}
         parsed = _parse_tool_args(fn.get("arguments"))
         if redact:
-            try:
-                parsed = json.loads(_redact(json.dumps(parsed), redact))
-            except (json.JSONDecodeError, ValueError):
-                logger.warning("Trace upload redacted tool arguments are not valid JSON; refusing upload")
-                raise TraceRedactionError(_REDACTION_BLOCKED_MESSAGE)
+            parsed = _redact_tool_args(parsed, redact)
         blocks.append({"type": "tool_use", "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:16]}",
                        "name": fn.get("name") or tc.get("name") or "tool", "input": parsed})
     return blocks
